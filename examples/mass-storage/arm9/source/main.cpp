@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/statvfs.h>
 #include <nds/disc_io.h>
 #include <nds/arm9/cache.h>
 #include <fat.h>
@@ -32,12 +33,13 @@ extern u8 gDldiStub[];
 #define RGB15(r, g, b)  ((u16)(((r) & 31) | (((g) & 31) << 5) | (((b) & 31) << 10)))
 
 // VRAM layout per engine (within a single 128 KB bank: VRAM A for Main, VRAM C for Sub)
-// 0x0000..0x1FFF : BG0 4bpp tiles (charBase 0)
+// 0x0000..0x0FFF : BG0 4bpp tiles (97 text tiles + 9 progress bar tiles = 3.4 KB)
 // 0x1000..0x17FF : BG0 32x32 tilemap (mapBase 2 -> offset 0x1000)
 // 0x4000..0x1BFFF: BG3 256x192 16bpp bitmap (mapBase 1 -> offset 0x4000)
 static constexpr u32 BG_BITMAP_OFFSET_BYTES = 0x4000;
 static constexpr u32 BG_MAP_OFFSET_U16      = 0x1000 / 2;
 static constexpr u32 BG_IMAGE_BYTES         = 256 * 192 * 2;
+static constexpr u32 TILE_PROGRESS_BASE     = 97; // tiles 97..105 = 0..8 filled px
 
 enum TextPal : u16
 {
@@ -51,13 +53,22 @@ enum TextPal : u16
 
 static rtos_event_t sVblankEvent;
 
-// USB status updated by ARM7 via IPC_CHANNEL_SOUND
+// USB & RTC status updated by ARM7 via IPC_CHANNEL_SOUND
 static volatile u32 sUsbStatusFlags = 0;
 static volatile u32 sReadHoldFrames = 0;
 static volatile u32 sWriteHoldFrames = 0;
 static volatile u32 sReadKB = 0;
 static volatile u32 sWriteKB = 0;
+static volatile u32 sPackedTime = 0;
+static volatile bool sHasTime = false;
 static volatile bool sLoaderDisconnected = false;
+
+// SD storage info measured at startup before TinyUSB starts
+static bool sHasStorageStats = false;
+static u64 sTotalBytes = 0;
+static u64 sFreeBytes = 0;
+static u64 sUsedBytes = 0;
+static u32 sUsedPercent = 0;
 
 // Preloaded Pico Loader binaries for returning to fat:/_picoboot.nds
 static u8* sPicoLoader9Buf = nullptr;
@@ -132,6 +143,11 @@ static void usbStatusIpcHandler(u32 channel, u32 data, void* arg)
     {
         sWriteKB = val;
         sWriteHoldFrames = 24;
+    }
+    else if (tag == USB_IPC_TAG_TIME)
+    {
+        sPackedTime = val;
+        sHasTime = true;
     }
 }
 
@@ -247,7 +263,7 @@ static int jsonGetInt(const char* json, const char* key, int fallback)
 }
 
 // -----------------------------------------------------------------------------
-// Graphics / Text Console / Theme Background
+// Graphics / Text Console / Progress Bar / Theme Background
 // -----------------------------------------------------------------------------
 static void wordCopyToVram(vu16* dst, const u16* src, u32 byteCount)
 {
@@ -285,6 +301,30 @@ static void uploadFontTiles(vu16* tileBase)
             dst[row * 2 + 1] = (u16)(row4bpp >> 16);
         }
     }
+
+    // Tiles 97..105: pixel-smooth progress bar segments (0..8 filled pixels)
+    // Top & bottom border = index 2, filled bar = index 1, empty track = index 3
+    for (u32 fillPx = 0; fillPx <= 8; fillPx++)
+    {
+        vu16* dst = tileBase + (TILE_PROGRESS_BASE + fillPx) * 16;
+        for (u32 row = 0; row < 8; row++)
+        {
+            u32 row4bpp = 0;
+            for (u32 col = 0; col < 8; col++)
+            {
+                u32 pix;
+                if (row == 0 || row == 7)
+                    pix = 2u; // top/bottom border
+                else if (col < fillPx)
+                    pix = 1u; // filled portion (uses palette's fg color)
+                else
+                    pix = 3u; // empty track
+                row4bpp |= (pix << (col * 4));
+            }
+            dst[row * 2 + 0] = (u16)(row4bpp & 0xFFFFu);
+            dst[row * 2 + 1] = (u16)(row4bpp >> 16);
+        }
+    }
 }
 
 static void initTextPalettes(vu16* pal)
@@ -303,7 +343,9 @@ static void initTextPalettes(vu16* pal)
         vu16* row = pal + p * 16;
         row[0] = 0;
         row[1] = fgColors[p];
-        row[7] = RGB15(2, 3, 5); // dark readable panel backing
+        row[2] = RGB15(10, 18, 24); // bar border
+        row[3] = RGB15(5, 7, 11);   // empty bar track
+        row[7] = RGB15(2, 3, 5);    // dark readable panel backing
     }
 }
 
@@ -323,7 +365,6 @@ static void drawBox(vu16* map, int x, int y, int w, int h)
         }
     }
 
-    // Subtle border using ASCII characters
     for (int rx = x + 1; rx < x + w - 1; rx++)
     {
         map[y * 32 + rx]           = (PAL_CYAN << 12) | (u16)(('-' - 0x20) + 2);
@@ -334,9 +375,9 @@ static void drawBox(vu16* map, int x, int y, int w, int h)
         map[ry * 32 + x]           = (PAL_CYAN << 12) | (u16)(('|' - 0x20) + 2);
         map[ry * 32 + (x + w - 1)] = (PAL_CYAN << 12) | (u16)(('|' - 0x20) + 2);
     }
-    map[y * 32 + x]                   = (PAL_CYAN << 12) | (u16)(('+' - 0x20) + 2);
-    map[y * 32 + (x + w - 1)]         = (PAL_CYAN << 12) | (u16)(('+' - 0x20) + 2);
-    map[(y + h - 1) * 32 + x]         = (PAL_CYAN << 12) | (u16)(('+' - 0x20) + 2);
+    map[y * 32 + x]                     = (PAL_CYAN << 12) | (u16)(('+' - 0x20) + 2);
+    map[y * 32 + (x + w - 1)]           = (PAL_CYAN << 12) | (u16)(('+' - 0x20) + 2);
+    map[(y + h - 1) * 32 + x]           = (PAL_CYAN << 12) | (u16)(('+' - 0x20) + 2);
     map[(y + h - 1) * 32 + (x + w - 1)] = (PAL_CYAN << 12) | (u16)(('+' - 0x20) + 2);
 }
 
@@ -361,6 +402,42 @@ static void drawTextPadded(vu16* map, int x, int y, int width, TextPal pal, cons
         buf[i] = (i < len) ? text[i] : ' ';
     buf[width] = '\0';
     drawText(map, x, y, pal, buf);
+}
+
+static void drawProgressBar(vu16* map, int x, int y, int widthTiles, u64 used, u64 total, TextPal pal)
+{
+    u32 totalPx = (u32)widthTiles * 8u;
+    u32 filledPx = (total > 0) ? (u32)((used * (u64)totalPx) / total) : 0u;
+    if (filledPx > totalPx)
+        filledPx = totalPx;
+
+    for (int i = 0; i < widthTiles; i++)
+    {
+        u32 startPx = (u32)i * 8u;
+        u32 segFill = 0;
+        if (filledPx >= startPx + 8u)
+            segFill = 8u;
+        else if (filledPx > startPx)
+            segFill = filledPx - startPx;
+
+        map[y * 32 + x + i] = (u16)((pal << 12) | (TILE_PROGRESS_BASE + segFill));
+    }
+}
+
+static void formatByteSize(u64 bytes, char* out, size_t outSize)
+{
+    const u64 gib = 1024ULL * 1024ULL * 1024ULL;
+    const u64 mib = 1024ULL * 1024ULL;
+    if (bytes >= gib)
+    {
+        u32 tenths = (u32)((bytes * 10ULL) / gib);
+        snprintf(out, outSize, "%lu.%luGB", (unsigned long)(tenths / 10u), (unsigned long)(tenths % 10u));
+    }
+    else
+    {
+        u32 mb = (u32)(bytes / mib);
+        snprintf(out, outSize, "%luMB", (unsigned long)mb);
+    }
 }
 
 static void fillSolidBackground(vu16* bmpVram, u16 color15)
@@ -478,9 +555,8 @@ static void initVideo()
 static void returnToPicoLauncher()
 {
     vu16* subMap = GFX_BG_SUB + BG_MAP_OFFSET_U16;
-    drawTextPadded(subMap, 2, 16, 28, PAL_YELLOW, "Disconnecting USB...");
+    drawTextPadded(subMap, 3, 16, 26, PAL_YELLOW, "Disconnecting USB...");
 
-    // Wait briefly if a write just finished so host buffers settle
     while (sWriteHoldFrames > 0)
     {
         sWriteHoldFrames--;
@@ -494,7 +570,6 @@ static void returnToPicoLauncher()
         rtos_waitEvent(&sVblankEvent, true, true);
     }
 
-    // Blank screens cleanly before overwriting VRAM with Pico Loader
     REG_DISPCNT = 0;
     REG_DISPCNT_SUB = 0;
 
@@ -503,7 +578,6 @@ static void returnToPicoLauncher()
     mem_setVramCMapping(MEM_VRAM_C_LCDC);
     mem_setVramDMapping(MEM_VRAM_D_LCDC);
 
-    // Prepare picoLoader7 header in main RAM first (VRAM does not allow byte writes!)
     pload_header7_t* hdr = (pload_header7_t*)sPicoLoader7Buf;
     hdr->dldiDriver = gDldiStub;
     hdr->bootDrive = PLOAD_BOOT_DRIVE_DLDI;
@@ -514,7 +588,6 @@ static void returnToPicoLauncher()
     if (hdr->apiVersion >= 3)
         hdr->v3.cheats = nullptr;
 
-    // Word-copy both loaders into LCDC VRAM
     wordCopyToVram((vu16*)0x06800000, (const u16*)sPicoLoader9Buf, (sPicoLoader9Size + 3u) & ~3u);
     wordCopyToVram((vu16*)0x06840000, (const u16*)sPicoLoader7Buf, (sPicoLoader7Size + 3u) & ~3u);
 
@@ -522,7 +595,6 @@ static void returnToPicoLauncher()
     DC_FlushAll();
     IC_InvalidateAll();
 
-    // Disable ARM9 IRQs & DMA
     *(vu32*)0x04000208 = 0;   // REG_IME
     *(vu32*)0x04000210 = 0;   // REG_IE
     *(vu32*)0x04000214 = ~0u; // REG_IF
@@ -531,7 +603,6 @@ static void returnToPicoLauncher()
     *(vu32*)0x040000D4 = 0;   // DMA2CNT
     *(vu32*)0x040000E0 = 0;   // DMA3CNT
 
-    // Map VRAM C and D to ARM7 (appears at 0x06000000 on ARM7)
     mem_setVramCMapping(MEM_VRAM_C_ARM7_00000);
     mem_setVramDMapping(MEM_VRAM_D_ARM7_20000);
 
@@ -550,13 +621,42 @@ static void drawStaticHud(bool picoLoaderReady)
     vu16* topMap = GFX_BG_MAIN + BG_MAP_OFFSET_U16;
     vu16* subMap = GFX_BG_SUB + BG_MAP_OFFSET_U16;
 
-    // Top screen panel
+    // Upper top-screen panel (USB status & counters)
     drawBox(topMap, 1, 2, 30, 12);
     drawText(topMap, 3, 3, PAL_CYAN, "DSpico USB SD Reader");
 
     char line[32];
     snprintf(line, sizeof(line), "Theme: %.20s", sThemeName);
     drawText(topMap, 3, 5, PAL_GRAY, line);
+
+    // Lower top-screen panel (fits inside the lower theme box: rows 15..20)
+    drawBox(topMap, 2, 15, 28, 6);
+    if (sHasStorageStats)
+    {
+        char freeStr[12], totalStr[12], usedStr[12];
+        formatByteSize(sFreeBytes,  freeStr,  sizeof(freeStr));
+        formatByteSize(sTotalBytes, totalStr, sizeof(totalStr));
+        formatByteSize(sUsedBytes,  usedStr,  sizeof(usedStr));
+
+        TextPal barPal = PAL_GREEN;
+        if (sUsedPercent >= 90u)
+            barPal = PAL_RED;
+        else if (sUsedPercent >= 75u)
+            barPal = PAL_YELLOW;
+
+        snprintf(line, sizeof(line), "Free: %s / %s", freeStr, totalStr);
+        drawTextPadded(topMap, 3, 17, 26, PAL_WHITE, line);
+
+        drawProgressBar(topMap, 3, 18, 26, sUsedBytes, sTotalBytes, barPal);
+
+        snprintf(line, sizeof(line), "Used: %-7s   %3lu%% Full", usedStr, (unsigned long)sUsedPercent);
+        drawTextPadded(topMap, 3, 19, 26, barPal, line);
+    }
+    else
+    {
+        drawTextPadded(topMap, 3, 17, 26, PAL_GRAY, "SD Storage: Unavailable");
+        drawProgressBar(topMap, 3, 18, 26, 0, 1, PAL_GRAY);
+    }
 
     // Bottom screen panel
     drawBox(subMap, 1, 11, 30, 9);
@@ -611,6 +711,30 @@ static void updateDynamicHud(u32 frame)
     drawTextPadded(topMap, 3, 11, 26, PAL_CYAN, stats);
     snprintf(stats, sizeof(stats), "Write: %lu KB", (unsigned long)sWriteKB);
     drawTextPadded(topMap, 3, 12, 26, PAL_CYAN, stats);
+
+    // Live device clock inside row 16 of the lower box
+    char clockLine[32];
+    if (sHasTime)
+    {
+        u32 packed = sPackedTime;
+        u32 hour24 = (packed >> 16) & 0x1Fu;
+        u32 min    = (packed >> 8)  & 0x3Fu;
+        u32 sec    = packed         & 0x3Fu;
+        bool isPm  = (hour24 >= 12u);
+        u32 hour12 = hour24 % 12u;
+        if (hour12 == 0u) hour12 = 12u;
+
+        snprintf(clockLine, sizeof(clockLine), "Time: %02lu:%02lu:%02lu %s",
+                 (unsigned long)hour12,
+                 (unsigned long)min,
+                 (unsigned long)sec,
+                 isPm ? "PM" : "AM");
+        drawTextPadded(topMap, 3, 16, 26, PAL_CYAN, clockLine);
+    }
+    else
+    {
+        drawTextPadded(topMap, 3, 16, 26, PAL_GRAY, "Time: --:--:-- --");
+    }
 }
 
 int main(int argc, char* argv[])
@@ -639,6 +763,21 @@ int main(int argc, char* argv[])
             GFX_BG_SUB  + (BG_BITMAP_OFFSET_BYTES / 2)
         );
 
+        struct statvfs st;
+        if (statvfs("fat:/", &st) == 0 && st.f_blocks > 0)
+        {
+            u64 blockSize = (u64)(st.f_frsize ? st.f_frsize : st.f_bsize);
+            sTotalBytes = (u64)st.f_blocks * blockSize;
+            sFreeBytes  = (u64)st.f_bfree  * blockSize;
+            if (sFreeBytes > sTotalBytes)
+                sFreeBytes = sTotalBytes;
+            sUsedBytes = sTotalBytes - sFreeBytes;
+            sUsedPercent = (sTotalBytes > 0) ? (u32)((sUsedBytes * 100ULL) / sTotalBytes) : 0u;
+            if (sUsedPercent > 100u)
+                sUsedPercent = 100u;
+            sHasStorageStats = true;
+        }
+
         sPicoLoader9Buf = readWholeFile("fat:/_pico/picoLoader9.bin", &sPicoLoader9Size);
         sPicoLoader7Buf = readWholeFile("fat:/_pico/picoLoader7.bin", &sPicoLoader7Size);
         picoLoaderReady = (sPicoLoader9Buf != nullptr && sPicoLoader7Buf != nullptr);
@@ -664,7 +803,6 @@ int main(int argc, char* argv[])
     rtos_enableIrqMask(RTOS_IRQ_VBLANK);
     gfx_setVBlankIrqEnabled(true);
 
-    // Wait until START is released on boot so holding START doesn't immediately exit
     bool startPreviouslyPressed = ((REG_KEYINPUT & KEY_START_BIT) == 0);
     u32 frame = 0;
 
