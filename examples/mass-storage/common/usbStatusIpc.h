@@ -5,6 +5,7 @@
 #define USB_IPC_TAG_STATUS      0
 #define USB_IPC_TAG_READ_KB     1
 #define USB_IPC_TAG_WRITE_KB    2
+#define USB_IPC_TAG_TIME        3
 #define USB_IPC_VAL_MASK        0x00FFFFFFu
 
 #define USB_STATUS_MOUNTED      (1u << 0)
