@@ -43,12 +43,12 @@ static constexpr u32 TILE_PROGRESS_BASE     = 97; // tiles 97..105 = 0..8 filled
 
 enum TextPal : u16
 {
-    PAL_WHITE  = 0,
+    PAL_TEXT   = 0,
     PAL_GREEN  = 1,
     PAL_YELLOW = 2,
     PAL_RED    = 3,
-    PAL_CYAN   = 4,
-    PAL_GRAY   = 5
+    PAL_ACCENT = 4,
+    PAL_MUTED  = 5
 };
 
 static rtos_event_t sVblankEvent;
@@ -76,7 +76,12 @@ static u32 sPicoLoader9Size = 0;
 static u8* sPicoLoader7Buf = nullptr;
 static u32 sPicoLoader7Size = 0;
 
+// Active theme styling (loaded from theme.json)
 static char sThemeName[64] = "material";
+static bool sDarkTheme = true;
+static int sPrimaryR = 100;
+static int sPrimaryG = 200;
+static int sPrimaryB = 240;
 
 // -----------------------------------------------------------------------------
 // DISC_INTERFACE wrapper using dldiIpc (runs BEFORE TinyUSB starts on ARM7)
@@ -262,6 +267,61 @@ static int jsonGetInt(const char* json, const char* key, int fallback)
     return atoi(v);
 }
 
+static int clamp255(int v)
+{
+    if (v < 0) return 0;
+    if (v > 255) return 255;
+    return v;
+}
+
+static int clamp31(int v)
+{
+    if (v < 0) return 0;
+    if (v > 31) return 31;
+    return v;
+}
+
+static int hexVal(char c)
+{
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+    if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+    return -1;
+}
+
+static void parsePrimaryColor(const char* themeJson)
+{
+    const char* prim = findJsonKeyValue(themeJson, "primaryColor");
+    if (!prim)
+        return;
+
+    if (*prim == '"')
+    {
+        // Optional "#RRGGBB" fallback
+        prim++;
+        if (*prim == '#')
+            prim++;
+        int d[6];
+        for (int i = 0; i < 6; i++)
+        {
+            d[i] = hexVal(prim[i]);
+            if (d[i] < 0)
+                return;
+        }
+        sPrimaryR = (d[0] << 4) | d[1];
+        sPrimaryG = (d[2] << 4) | d[3];
+        sPrimaryB = (d[4] << 4) | d[5];
+        return;
+    }
+
+    if (*prim == '{')
+    {
+        sPrimaryR = clamp255(jsonGetInt(prim, "r", sPrimaryR));
+        sPrimaryG = clamp255(jsonGetInt(prim, "g", sPrimaryG));
+        sPrimaryB = clamp255(jsonGetInt(prim, "b", sPrimaryB));
+    }
+}
+
 // -----------------------------------------------------------------------------
 // Graphics / Text Console / Progress Bar / Theme Background
 // -----------------------------------------------------------------------------
@@ -280,11 +340,11 @@ static void uploadFontTiles(vu16* tileBase)
     for (u32 i = 0; i < 16; i++)
         tileBase[i] = 0x0000;
 
-    // Tile 1: solid dark panel background (index 7)
+    // Tile 1: solid panel background (index 7)
     for (u32 i = 0; i < 16; i++)
         tileBase[16 + i] = 0x7777;
 
-    // Tiles 2..96: ASCII 0x20..0x7E over dark panel (index 7 bg, index 1 fg)
+    // Tiles 2..96: ASCII 0x20..0x7E over panel (index 7 bg, index 1 fg)
     for (u32 c = 0; c < 95; c++)
     {
         vu16* dst = tileBase + (2 + c) * 16;
@@ -303,7 +363,6 @@ static void uploadFontTiles(vu16* tileBase)
     }
 
     // Tiles 97..105: pixel-smooth progress bar segments (0..8 filled pixels)
-    // Top & bottom border = index 2, filled bar = index 1, empty track = index 3
     for (u32 fillPx = 0; fillPx <= 8; fillPx++)
     {
         vu16* dst = tileBase + (TILE_PROGRESS_BASE + fillPx) * 16;
@@ -316,7 +375,7 @@ static void uploadFontTiles(vu16* tileBase)
                 if (row == 0 || row == 7)
                     pix = 2u; // top/bottom border
                 else if (col < fillPx)
-                    pix = 1u; // filled portion (uses palette's fg color)
+                    pix = 1u; // filled portion
                 else
                     pix = 3u; // empty track
                 row4bpp |= (pix << (col * 4));
@@ -329,23 +388,65 @@ static void uploadFontTiles(vu16* tileBase)
 
 static void initTextPalettes(vu16* pal)
 {
-    const u16 fgColors[6] = {
-        RGB15(31, 31, 31), // PAL_WHITE
-        RGB15(10, 31, 12), // PAL_GREEN
-        RGB15(31, 26, 6),  // PAL_YELLOW
-        RGB15(31, 9, 9),   // PAL_RED
-        RGB15(12, 27, 31), // PAL_CYAN
-        RGB15(20, 21, 24)  // PAL_GRAY
-    };
+    const int r5 = sPrimaryR >> 3;
+    const int g5 = sPrimaryG >> 3;
+    const int b5 = sPrimaryB >> 3;
+
+    u16 panelBg;
+    u16 barTrack;
+    u16 accentColor;
+    u16 fgColors[6];
+
+    if (sDarkTheme)
+    {
+        panelBg  = RGB15(1 + r5 / 10, 1 + g5 / 10, 1 + b5 / 10);
+        barTrack = RGB15(4 + r5 / 8,  4 + g5 / 8,  4 + b5 / 8);
+
+        // Lift primaryColor slightly so dark primary colors stay vibrant on dark panels
+        int ar = clamp31(r5 + (31 - r5) / 4);
+        int ag = clamp31(g5 + (31 - g5) / 4);
+        int ab = clamp31(b5 + (31 - b5) / 4);
+        accentColor = RGB15(ar, ag, ab);
+
+        fgColors[PAL_TEXT]   = RGB15(31, 31, 31);
+        fgColors[PAL_GREEN]  = RGB15(10, 31, 12);
+        fgColors[PAL_YELLOW] = RGB15(31, 26, 6);
+        fgColors[PAL_RED]    = RGB15(31, 9, 9);
+        fgColors[PAL_ACCENT] = accentColor;
+        fgColors[PAL_MUTED]  = RGB15(20, 21, 24);
+    }
+    else
+    {
+        panelBg  = RGB15(clamp31(27 + r5 / 8),  clamp31(27 + g5 / 8),  clamp31(27 + b5 / 8));
+        barTrack = RGB15(clamp31(22 + r5 / 10), clamp31(22 + g5 / 10), clamp31(22 + b5 / 10));
+
+        // Ensure pastel primary colors remain crisp & readable on light panels
+        int ar = r5, ag = g5, ab = b5;
+        int lum = ar * 2 + ag * 5 + ab;
+        if (lum > 140)
+        {
+            ar = (ar * 140) / lum;
+            ag = (ag * 140) / lum;
+            ab = (ab * 140) / lum;
+        }
+        accentColor = RGB15(clamp31(ar), clamp31(ag), clamp31(ab));
+
+        fgColors[PAL_TEXT]   = RGB15(4, 4, 6);
+        fgColors[PAL_GREEN]  = RGB15(2, 19, 4);
+        fgColors[PAL_YELLOW] = RGB15(23, 13, 0);
+        fgColors[PAL_RED]    = RGB15(25, 3, 3);
+        fgColors[PAL_ACCENT] = accentColor;
+        fgColors[PAL_MUTED]  = RGB15(12, 12, 15);
+    }
 
     for (u32 p = 0; p < 6; p++)
     {
         vu16* row = pal + p * 16;
         row[0] = 0;
         row[1] = fgColors[p];
-        row[2] = RGB15(10, 18, 24); // bar border
-        row[3] = RGB15(5, 7, 11);   // empty bar track
-        row[7] = RGB15(2, 3, 5);    // dark readable panel backing
+        row[2] = accentColor; // progress bar border
+        row[3] = barTrack;    // empty bar track
+        row[7] = panelBg;     // panel backing
     }
 }
 
@@ -361,24 +462,24 @@ static void drawBox(vu16* map, int x, int y, int w, int h)
     {
         for (int rx = x; rx < x + w; rx++)
         {
-            map[ry * 32 + rx] = 1; // Tile 1 = dark panel fill
+            map[ry * 32 + rx] = 1; // Tile 1 = panel fill
         }
     }
 
     for (int rx = x + 1; rx < x + w - 1; rx++)
     {
-        map[y * 32 + rx]           = (PAL_CYAN << 12) | (u16)(('-' - 0x20) + 2);
-        map[(y + h - 1) * 32 + rx] = (PAL_CYAN << 12) | (u16)(('-' - 0x20) + 2);
+        map[y * 32 + rx]           = (PAL_ACCENT << 12) | (u16)(('-' - 0x20) + 2);
+        map[(y + h - 1) * 32 + rx] = (PAL_ACCENT << 12) | (u16)(('-' - 0x20) + 2);
     }
     for (int ry = y + 1; ry < y + h - 1; ry++)
     {
-        map[ry * 32 + x]           = (PAL_CYAN << 12) | (u16)(('|' - 0x20) + 2);
-        map[ry * 32 + (x + w - 1)] = (PAL_CYAN << 12) | (u16)(('|' - 0x20) + 2);
+        map[ry * 32 + x]           = (PAL_ACCENT << 12) | (u16)(('|' - 0x20) + 2);
+        map[ry * 32 + (x + w - 1)] = (PAL_ACCENT << 12) | (u16)(('|' - 0x20) + 2);
     }
-    map[y * 32 + x]                     = (PAL_CYAN << 12) | (u16)(('+' - 0x20) + 2);
-    map[y * 32 + (x + w - 1)]           = (PAL_CYAN << 12) | (u16)(('+' - 0x20) + 2);
-    map[(y + h - 1) * 32 + x]           = (PAL_CYAN << 12) | (u16)(('+' - 0x20) + 2);
-    map[(y + h - 1) * 32 + (x + w - 1)] = (PAL_CYAN << 12) | (u16)(('+' - 0x20) + 2);
+    map[y * 32 + x]                     = (PAL_ACCENT << 12) | (u16)(('+' - 0x20) + 2);
+    map[y * 32 + (x + w - 1)]           = (PAL_ACCENT << 12) | (u16)(('+' - 0x20) + 2);
+    map[(y + h - 1) * 32 + x]           = (PAL_ACCENT << 12) | (u16)(('+' - 0x20) + 2);
+    map[(y + h - 1) * 32 + (x + w - 1)] = (PAL_ACCENT << 12) | (u16)(('+' - 0x20) + 2);
 }
 
 static void drawText(vu16* map, int x, int y, TextPal pal, const char* text)
@@ -486,24 +587,18 @@ static void loadActivePicoTheme(vu16* topBmp, vu16* subBmp)
     char* themeJson = (char*)readWholeFile(path, nullptr);
     if (themeJson)
     {
-        bool dark = jsonGetBool(themeJson, "darkTheme", true);
-        const char* prim = findJsonKeyValue(themeJson, "primaryColor");
-        int r = 160, g = 180, b = 220;
-        if (prim)
+        sDarkTheme = jsonGetBool(themeJson, "darkTheme", true);
+        parsePrimaryColor(themeJson);
+
+        if (sDarkTheme)
         {
-            r = jsonGetInt(prim, "r", r);
-            g = jsonGetInt(prim, "g", g);
-            b = jsonGetInt(prim, "b", b);
-        }
-        if (dark)
-        {
-            fallbackTop = RGB15(2 + r / 64, 2 + g / 64, 3 + b / 64);
-            fallbackSub = RGB15(1 + r / 80, 1 + g / 80, 2 + b / 80);
+            fallbackTop = RGB15(2 + sPrimaryR / 64, 2 + sPrimaryG / 64, 3 + sPrimaryB / 64);
+            fallbackSub = RGB15(1 + sPrimaryR / 80, 1 + sPrimaryG / 80, 2 + sPrimaryB / 80);
         }
         else
         {
-            fallbackTop = RGB15(26 + r / 64, 26 + g / 64, 27 + b / 64);
-            fallbackSub = RGB15(25 + r / 64, 25 + g / 64, 26 + b / 64);
+            fallbackTop = RGB15(26 + sPrimaryR / 64, 26 + sPrimaryG / 64, 27 + sPrimaryB / 64);
+            fallbackSub = RGB15(25 + sPrimaryR / 64, 25 + sPrimaryG / 64, 26 + sPrimaryB / 64);
         }
         free(themeJson);
     }
@@ -621,18 +716,14 @@ static void drawStaticHud(bool picoLoaderReady)
     vu16* topMap = GFX_BG_MAIN + BG_MAP_OFFSET_U16;
     vu16* subMap = GFX_BG_SUB + BG_MAP_OFFSET_U16;
 
-    // Upper top-screen panel (USB status & counters)
-    drawBox(topMap, 1, 2, 30, 12);
-    drawText(topMap, 3, 3, PAL_CYAN, "DSpico USB SD Reader");
-
-    char line[32];
-    snprintf(line, sizeof(line), "Theme: %.20s", sThemeName);
-    drawText(topMap, 3, 5, PAL_GRAY, line);
+    // Upper top-screen panel (rows 4..11: USB status & Read/Write counters only)
+    drawBox(topMap, 1, 4, 30, 8);
 
     // Lower top-screen panel (fits inside the lower theme box: rows 15..20)
     drawBox(topMap, 2, 15, 28, 6);
     if (sHasStorageStats)
     {
+        char line[32];
         char freeStr[12], totalStr[12], usedStr[12];
         formatByteSize(sFreeBytes,  freeStr,  sizeof(freeStr));
         formatByteSize(sTotalBytes, totalStr, sizeof(totalStr));
@@ -645,7 +736,7 @@ static void drawStaticHud(bool picoLoaderReady)
             barPal = PAL_YELLOW;
 
         snprintf(line, sizeof(line), "Free: %s / %s", freeStr, totalStr);
-        drawTextPadded(topMap, 3, 17, 26, PAL_WHITE, line);
+        drawTextPadded(topMap, 3, 17, 26, PAL_TEXT, line);
 
         drawProgressBar(topMap, 3, 18, 26, sUsedBytes, sTotalBytes, barPal);
 
@@ -654,15 +745,15 @@ static void drawStaticHud(bool picoLoaderReady)
     }
     else
     {
-        drawTextPadded(topMap, 3, 17, 26, PAL_GRAY, "SD Storage: Unavailable");
-        drawProgressBar(topMap, 3, 18, 26, 0, 1, PAL_GRAY);
+        drawTextPadded(topMap, 3, 17, 26, PAL_MUTED, "SD Storage: Unavailable");
+        drawProgressBar(topMap, 3, 18, 26, 0, 1, PAL_MUTED);
     }
 
     // Bottom screen panel
     drawBox(subMap, 1, 11, 30, 9);
-    drawText(subMap, 3, 12, PAL_CYAN, "Controls & Tips");
-    drawText(subMap, 3, 14, PAL_WHITE, "Connect USB-C to host.");
-    drawText(subMap, 3, 15, PAL_GRAY,  "Eject drive before exit.");
+    drawText(subMap, 3, 12, PAL_ACCENT, "Controls & Tips");
+    drawText(subMap, 3, 14, PAL_TEXT,   "Connect USB-C to host.");
+    drawText(subMap, 3, 15, PAL_MUTED,  "Eject drive before exit.");
 
     if (picoLoaderReady)
         drawText(subMap, 3, 18, PAL_GREEN, "[START] Return to Menu");
@@ -681,36 +772,36 @@ static void updateDynamicHud(u32 frame)
     const bool writing   = sWriteHoldFrames > 0;
 
     if (mounted && !suspended)
-        drawTextPadded(topMap, 3, 7, 26, PAL_GREEN, "USB: CONNECTED");
+        drawTextPadded(topMap, 3, 5, 26, PAL_GREEN, "USB: CONNECTED");
     else if (suspended)
-        drawTextPadded(topMap, 3, 7, 26, PAL_YELLOW, "USB: SUSPENDED");
+        drawTextPadded(topMap, 3, 5, 26, PAL_YELLOW, "USB: SUSPENDED");
     else if (connected)
-        drawTextPadded(topMap, 3, 7, 26, PAL_YELLOW, "USB: ENUMERATING...");
+        drawTextPadded(topMap, 3, 5, 26, PAL_YELLOW, "USB: ENUMERATING...");
     else
-        drawTextPadded(topMap, 3, 7, 26, PAL_GRAY, "USB: WAITING FOR HOST");
+        drawTextPadded(topMap, 3, 5, 26, PAL_MUTED, "USB: WAITING FOR HOST");
 
     static const char spinner[4] = {'|', '/', '-', '\\'};
     char actLine[32];
     if (writing)
     {
         snprintf(actLine, sizeof(actLine), "SD: WRITING! DO NOT UNPLUG %c", spinner[(frame >> 2) & 3]);
-        drawTextPadded(topMap, 3, 9, 26, PAL_RED, actLine);
+        drawTextPadded(topMap, 3, 7, 26, PAL_RED, actLine);
     }
     else if (reading)
     {
         snprintf(actLine, sizeof(actLine), "SD: READING... %c", spinner[(frame >> 2) & 3]);
-        drawTextPadded(topMap, 3, 9, 26, PAL_YELLOW, actLine);
+        drawTextPadded(topMap, 3, 7, 26, PAL_YELLOW, actLine);
     }
     else
     {
-        drawTextPadded(topMap, 3, 9, 26, PAL_WHITE, "SD: IDLE");
+        drawTextPadded(topMap, 3, 7, 26, PAL_TEXT, "SD: IDLE");
     }
 
     char stats[32];
     snprintf(stats, sizeof(stats), "Read:  %lu KB", (unsigned long)sReadKB);
-    drawTextPadded(topMap, 3, 11, 26, PAL_CYAN, stats);
+    drawTextPadded(topMap, 3, 9, 26, PAL_ACCENT, stats);
     snprintf(stats, sizeof(stats), "Write: %lu KB", (unsigned long)sWriteKB);
-    drawTextPadded(topMap, 3, 12, 26, PAL_CYAN, stats);
+    drawTextPadded(topMap, 3, 10, 26, PAL_ACCENT, stats);
 
     // Live device clock inside row 16 of the lower box
     char clockLine[32];
@@ -729,11 +820,11 @@ static void updateDynamicHud(u32 frame)
                  (unsigned long)min,
                  (unsigned long)sec,
                  isPm ? "PM" : "AM");
-        drawTextPadded(topMap, 3, 16, 26, PAL_CYAN, clockLine);
+        drawTextPadded(topMap, 3, 16, 26, PAL_ACCENT, clockLine);
     }
     else
     {
-        drawTextPadded(topMap, 3, 16, 26, PAL_GRAY, "Time: --:--:-- --");
+        drawTextPadded(topMap, 3, 16, 26, PAL_MUTED, "Time: --:--:-- --");
     }
 }
 
@@ -762,6 +853,10 @@ int main(int argc, char* argv[])
             GFX_BG_MAIN + (BG_BITMAP_OFFSET_BYTES / 2),
             GFX_BG_SUB  + (BG_BITMAP_OFFSET_BYTES / 2)
         );
+
+        // Apply theme's primaryColor & darkTheme palette to both screens
+        initTextPalettes(BG_PAL_MAIN);
+        initTextPalettes(BG_PAL_SUB);
 
         struct statvfs st;
         if (statvfs("fat:/", &st) == 0 && st.f_blocks > 0)
