@@ -16,6 +16,8 @@
 #include <libtwl/i2c/i2cMcu.h>
 #include <libtwl/spi/spiPmic.h>
 #include "ipcServices/DldiIpcService.h"
+#include "ipcChannels.h"
+#include "usbStatusIpc.h"
 #include "ExitMode.h"
 #include "Arm7State.h"
 #include "tusb.h"
@@ -29,6 +31,16 @@ static rtos_event_t sVBlankEvent;
 static ExitMode sExitMode;
 static Arm7State sState;
 static volatile u8 sMcuIrqFlag = false;
+
+static volatile u8 sReadPulse = false;
+static volatile u8 sWritePulse = false;
+static volatile u32 sReadSectors = 0;
+static volatile u32 sWriteSectors = 0;
+static u32 sLastSentStatus = 0xFFFFFFFFu;
+static bool sUsbStarted = false;
+
+static volatile bool sDisconnectRequested = false;
+static int sDisconnectWaitFrames = 0;
 
 static u32 sSdBlockCount;
 static u8 sSector0Buffer[512] alignas(4);
@@ -47,6 +59,21 @@ static void vblankIrq(u32 irqMask)
 static void mcuIrq(u32 irq2Mask)
 {
     sMcuIrqFlag = true;
+}
+
+static void loaderIpcHandler(u32 channel, u32 data, void* arg)
+{
+    (void)channel;
+    (void)arg;
+    if (data == LOADER_CMD_DISCONNECT_USB)
+    {
+        sDisconnectRequested = true;
+    }
+    else if (data == LOADER_CMD_BOOT_PICOLOADER)
+    {
+        sExitMode = ExitMode::PicoLoader;
+        sState = Arm7State::ExitRequested;
+    }
 }
 
 static void checkMcuIrq(void)
@@ -85,6 +112,7 @@ static void initializeVBlankIrq()
 
 static void usbThreadMain(void* arg)
 {
+    (void)arg;
     while (true)
     {
         tud_task();
@@ -92,7 +120,6 @@ static void usbThreadMain(void* arg)
 }
 
 // Based on https://github.com/asiekierka/nrio-usb-disk/blob/main/source/msc.c msc_find_block_count by Asie
-// Note: This might not work correctly in some cases. It would be better if the DSpico would expose the actual SD capacity.
 static u32 findSdCardBlockCount()
 {
     rtos_lockMutex(&gCardMutex);
@@ -157,6 +184,7 @@ static void initializeArm7()
     rtc_init();
 
     sDldiIpcService.Start();
+    ipc_setChannelHandler(IPC_CHANNEL_LOADER, loaderIpcHandler, nullptr);
 
     snd_setMasterVolume(127);
     snd_setMasterEnable(true);
@@ -184,14 +212,72 @@ static void initializeArm7()
         .speed = TUSB_SPEED_AUTO
     };
     tusb_init(0, &dev_init);
+    sUsbStarted = true;
 
     rtos_createThread(&sUsbThread, 3, usbThreadMain, NULL, sUsbThreadStack, sizeof(sUsbThreadStack));
     rtos_wakeupThread(&sUsbThread);
 }
 
+static void sendUsbStatusUpdate()
+{
+    if (!sUsbStarted)
+        return;
+
+    bool didRead = mem_swapByte(false, &sReadPulse);
+    bool didWrite = mem_swapByte(false, &sWritePulse);
+
+    u32 status = 0;
+    if (tud_mounted())
+        status |= USB_STATUS_MOUNTED;
+    if (tud_suspended())
+        status |= USB_STATUS_SUSPENDED;
+    if (tud_connected())
+        status |= USB_STATUS_CONNECTED;
+    if (didRead)
+        status |= USB_STATUS_READING;
+    if (didWrite)
+        status |= USB_STATUS_WRITING;
+
+    if (status != sLastSentStatus)
+    {
+        sLastSentStatus = status;
+        ipc_sendFifoMessage(IPC_CHANNEL_SOUND, (USB_IPC_TAG_STATUS << USB_IPC_TAG_SHIFT) | (status & USB_IPC_VAL_MASK));
+    }
+
+    if (didRead)
+    {
+        u32 readKb = (sReadSectors >> 1) & USB_IPC_VAL_MASK;
+        ipc_sendFifoMessage(IPC_CHANNEL_SOUND, (USB_IPC_TAG_READ_KB << USB_IPC_TAG_SHIFT) | readKb);
+    }
+
+    if (didWrite)
+    {
+        u32 writeKb = (sWriteSectors >> 1) & USB_IPC_VAL_MASK;
+        ipc_sendFifoMessage(IPC_CHANNEL_SOUND, (USB_IPC_TAG_WRITE_KB << USB_IPC_TAG_SHIFT) | writeKb);
+    }
+}
+
 static void updateArm7IdleState()
 {
     checkMcuIrq();
+    sendUsbStatusUpdate();
+
+    if (sDisconnectRequested)
+    {
+        sDisconnectRequested = false;
+        if (sUsbStarted)
+            tud_disconnect();
+        snd_setMasterVolume(0);
+        sDisconnectWaitFrames = 15;
+    }
+
+    if (sDisconnectWaitFrames > 0)
+    {
+        if (--sDisconnectWaitFrames == 0)
+        {
+            ipc_sendFifoMessage(IPC_CHANNEL_LOADER, LOADER_RESP_DISCONNECTED);
+        }
+    }
 
     if (sState == Arm7State::ExitRequested)
     {
@@ -199,7 +285,7 @@ static void updateArm7IdleState()
     }
 }
 
-static bool performExit(ExitMode exitMode)
+static void performExit(ExitMode exitMode)
 {
     switch (exitMode)
     {
@@ -212,6 +298,36 @@ static bool performExit(ExitMode exitMode)
         case ExitMode::PowerOff:
         {
             pmic_shutdown();
+            break;
+        }
+        case ExitMode::PicoLoader:
+        {
+            // Disable sound
+            snd_setMasterVolume(0);
+            snd_setMasterEnable(false);
+            sys_setSoundPower(false);
+            dmaFillWords(0, (void*)0x04000400, 0x100);
+
+            // Disable IRQs
+            *(vu32*)0x04000208 = 0;      // REG_IME
+            *(vu32*)0x04000210 = 0;      // REG_IE
+            *(vu32*)0x04000214 = ~0u;    // REG_IF
+            if (isDSiMode())
+            {
+                *(vu32*)0x04000218 = 0;   // REG_AUXIE
+                *(vu32*)0x0400021C = ~0u; // REG_AUXIF
+            }
+
+            // Disable DMA
+            *(vu32*)0x040000BC = 0; // DMA0CNT
+            *(vu32*)0x040000C8 = 0; // DMA1CNT
+            *(vu32*)0x040000D4 = 0; // DMA2CNT
+            *(vu32*)0x040000E0 = 0; // DMA3CNT
+
+            // Read entryPoint from picoLoader7 header mapped at 0x06000000
+            void* entryPoint = *(void* const*)0x06000000;
+            ipc_setArm7SyncBits(5);
+            ((void (*)(void))entryPoint)();
             break;
         }
     }
@@ -255,8 +371,6 @@ int main()
     return 0;
 }
 
-// Invoked when received SCSI_CMD_INQUIRY
-// Application fill vendor id, product id and revision with string up to 8, 16, 4 characters respectively
 void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16], uint8_t product_rev[4])
 {
     (void) lun;
@@ -270,16 +384,12 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16
     memcpy(product_rev, rev, strlen(rev));
 }
 
-// Invoked when received Test Unit Ready command.
-// return true allowing host to read/write this LUN e.g SD card inserted
 bool tud_msc_test_unit_ready_cb(uint8_t lun)
 {
     (void) lun;
     return true;
 }
 
-// Invoked when received SCSI_CMD_READ_CAPACITY_10 and SCSI_CMD_READ_FORMAT_CAPACITY to determine the disk size
-// Application update block count and block size
 void tud_msc_capacity_cb(uint8_t lun, uint32_t* block_count, uint16_t* block_size)
 {
     (void) lun;
@@ -288,18 +398,15 @@ void tud_msc_capacity_cb(uint8_t lun, uint32_t* block_count, uint16_t* block_siz
     *block_size  = 512;
 }
 
-// Invoked when received Start Stop Unit command
-// - Start = 0 : stopped power mode, if load_eject = 1 : unload disk storage
-// - Start = 1 : active mode, if load_eject = 1 : load disk storage
 bool tud_msc_start_stop_cb(uint8_t lun, uint8_t power_condition, bool start, bool load_eject)
 {
     (void) lun;
     (void) power_condition;
+    (void) start;
+    (void) load_eject;
     return true;
 }
 
-// Callback invoked when received READ10 command.
-// Copy disk's data to buffer (up to bufsize) and return number of copied bytes.
 int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buffer, uint32_t bufsize)
 {
     (void) lun;
@@ -308,6 +415,9 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buff
     {
         return -1;
     }
+
+    sReadPulse = true;
+    sReadSectors += bufsize / 512;
 
     rtos_lockMutex(&gCardMutex);
     _DLDI_readSectors_ptr(lba, bufsize / 512, buffer);
@@ -322,8 +432,6 @@ bool tud_msc_is_writable_cb(uint8_t lun)
     return true;
 }
 
-// Callback invoked when received WRITE10 command.
-// Process data in buffer to disk's storage and return number of written bytes
 int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t* buffer, uint32_t bufsize)
 {
     (void) lun;
@@ -333,6 +441,9 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t* 
         return -1;
     }
 
+    sWritePulse = true;
+    sWriteSectors += bufsize / 512;
+
     rtos_lockMutex(&gCardMutex);
     _DLDI_writeSectors_ptr(lba, bufsize / 512, buffer);
     rtos_unlockMutex(&gCardMutex);
@@ -340,49 +451,12 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t* 
     return (int32_t)bufsize;
 }
 
-// Callback invoked when received an SCSI command not in built-in list below
-// - READ_CAPACITY10, READ_FORMAT_CAPACITY, INQUIRY, MODE_SENSE6, REQUEST_SENSE
-// - READ10 and WRITE10 has their own callbacks
 int32_t tud_msc_scsi_cb(uint8_t lun, uint8_t const scsi_cmd[16], void* buffer, uint16_t bufsize)
 {
-    // read10 & write10 has their own callback and MUST not be handled here
+    (void)scsi_cmd;
+    (void)buffer;
+    (void)bufsize;
 
-    void const* response = NULL;
-    int32_t resplen = 0;
-
-    // most scsi handled is input
-    bool in_xfer = true;
-
-    switch (scsi_cmd[0])
-    {
-        default:
-        {
-            // Set Sense = Invalid Command Operation
-            tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0x00);
-
-            // negative means error -> tinyusb could stall and/or response with failed status
-            resplen = -1;
-            break;
-        }
-    }
-
-    // return resplen must not larger than bufsize
-    if (resplen > bufsize)
-    {
-        resplen = bufsize;
-    }
-
-    if (response && (resplen > 0))
-    {
-        if(in_xfer)
-        {
-            memcpy(buffer, response, (size_t)resplen);
-        }
-        else
-        {
-            // SCSI output
-        }
-    }
-
-    return (int32_t)resplen;
+    tud_msc_set_sense(lun, SCSI_SENSE_ILLEGAL_REQUEST, 0x20, 0x00);
+    return -1;
 }
