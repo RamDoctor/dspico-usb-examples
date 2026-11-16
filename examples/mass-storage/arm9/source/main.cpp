@@ -62,6 +62,7 @@ static volatile u32 sWriteKB = 0;
 static volatile u32 sPackedTime = 0;
 static volatile bool sHasTime = false;
 static volatile bool sLoaderDisconnected = false;
+static bool sScreensOff = false;
 
 // SD storage info measured at startup before TinyUSB starts
 static bool sHasStorageStats = false;
@@ -297,7 +298,6 @@ static void parsePrimaryColor(const char* themeJson)
 
     if (*prim == '"')
     {
-        // Optional "#RRGGBB" fallback
         prim++;
         if (*prim == '#')
             prim++;
@@ -402,7 +402,6 @@ static void initTextPalettes(vu16* pal)
         panelBg  = RGB15(1 + r5 / 10, 1 + g5 / 10, 1 + b5 / 10);
         barTrack = RGB15(4 + r5 / 8,  4 + g5 / 8,  4 + b5 / 8);
 
-        // Lift primaryColor slightly so dark primary colors stay vibrant on dark panels
         int ar = clamp31(r5 + (31 - r5) / 4);
         int ag = clamp31(g5 + (31 - g5) / 4);
         int ab = clamp31(b5 + (31 - b5) / 4);
@@ -420,7 +419,6 @@ static void initTextPalettes(vu16* pal)
         panelBg  = RGB15(clamp31(27 + r5 / 8),  clamp31(27 + g5 / 8),  clamp31(27 + b5 / 8));
         barTrack = RGB15(clamp31(22 + r5 / 10), clamp31(22 + g5 / 10), clamp31(22 + b5 / 10));
 
-        // Ensure pastel primary colors remain crisp & readable on light panels
         int ar = r5, ag = g5, ab = b5;
         int lum = ar * 2 + ag * 5 + ab;
         if (lum > 140)
@@ -649,8 +647,11 @@ static void initVideo()
 // -----------------------------------------------------------------------------
 static void returnToPicoLauncher()
 {
+    REG_MASTER_BRIGHT = 0;
+    REG_MASTER_BRIGHT_SUB = 0;
+
     vu16* subMap = GFX_BG_SUB + BG_MAP_OFFSET_U16;
-    drawTextPadded(subMap, 3, 16, 26, PAL_YELLOW, "Disconnecting USB...");
+    drawTextPadded(subMap, 3, 17, 26, PAL_YELLOW, "Disconnecting USB...");
 
     while (sWriteHoldFrames > 0)
     {
@@ -716,11 +717,11 @@ static void drawStaticHud(bool picoLoaderReady)
     vu16* topMap = GFX_BG_MAIN + BG_MAP_OFFSET_U16;
     vu16* subMap = GFX_BG_SUB + BG_MAP_OFFSET_U16;
 
-    // Upper top-screen panel (rows 4..11: USB status & Read/Write counters only)
+    // Upper top-screen panel (rows 4..11: USB status & Read/Write counters)
     drawBox(topMap, 1, 4, 30, 8);
 
-    // Lower top-screen panel (fits inside the lower theme box: rows 15..20)
-    drawBox(topMap, 2, 15, 28, 6);
+    // Lower top-screen panel (stretched across rows 15..21 to fill the lower frame)
+    drawBox(topMap, 2, 15, 28, 7);
     if (sHasStorageStats)
     {
         char line[32];
@@ -736,17 +737,17 @@ static void drawStaticHud(bool picoLoaderReady)
             barPal = PAL_YELLOW;
 
         snprintf(line, sizeof(line), "Free: %s / %s", freeStr, totalStr);
-        drawTextPadded(topMap, 3, 17, 26, PAL_TEXT, line);
+        drawTextPadded(topMap, 3, 18, 26, PAL_TEXT, line);
 
-        drawProgressBar(topMap, 3, 18, 26, sUsedBytes, sTotalBytes, barPal);
+        drawProgressBar(topMap, 3, 19, 26, sUsedBytes, sTotalBytes, barPal);
 
         snprintf(line, sizeof(line), "Used: %-7s   %3lu%% Full", usedStr, (unsigned long)sUsedPercent);
-        drawTextPadded(topMap, 3, 19, 26, barPal, line);
+        drawTextPadded(topMap, 3, 20, 26, barPal, line);
     }
     else
     {
-        drawTextPadded(topMap, 3, 17, 26, PAL_MUTED, "SD Storage: Unavailable");
-        drawProgressBar(topMap, 3, 18, 26, 0, 1, PAL_MUTED);
+        drawTextPadded(topMap, 3, 18, 26, PAL_MUTED, "SD Storage: Unavailable");
+        drawProgressBar(topMap, 3, 19, 26, 0, 1, PAL_MUTED);
     }
 
     // Bottom screen panel
@@ -754,6 +755,7 @@ static void drawStaticHud(bool picoLoaderReady)
     drawText(subMap, 3, 12, PAL_ACCENT, "Controls & Tips");
     drawText(subMap, 3, 14, PAL_TEXT,   "Connect USB-C to host.");
     drawText(subMap, 3, 15, PAL_MUTED,  "Eject drive before exit.");
+    drawText(subMap, 3, 16, PAL_MUTED,  "Tap screen: Toggle display");
 
     if (picoLoaderReady)
         drawText(subMap, 3, 18, PAL_GREEN, "[START] Return to Menu");
@@ -910,6 +912,15 @@ int main(int argc, char* argv[])
             sReadHoldFrames--;
         if (sWriteHoldFrames > 0)
             sWriteHoldFrames--;
+
+        bool screensOff = (sUsbStatusFlags & USB_STATUS_SCREENS_OFF) != 0;
+        if (screensOff != sScreensOff)
+        {
+            sScreensOff = screensOff;
+            u16 bright = screensOff ? ((2u << 14) | 16u) : 0u;
+            REG_MASTER_BRIGHT = bright;
+            REG_MASTER_BRIGHT_SUB = bright;
+        }
 
         updateDynamicHud(frame);
 
