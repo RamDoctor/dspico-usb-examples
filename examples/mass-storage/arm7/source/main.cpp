@@ -1,5 +1,6 @@
 #include "common.h"
 #include <nds/disc_io.h>
+#include <nds/arm7/touch.h>
 #include <libtwl/rtos/rtosIrq.h>
 #include <libtwl/rtos/rtosThread.h>
 #include <libtwl/rtos/rtosEvent.h>
@@ -22,9 +23,6 @@
 #include "Arm7State.h"
 #include "tusb.h"
 #include "usb_descriptors.h"
-
-#define REG_EXTKEYIN        (*(vu16*)0x04000136)
-#define EXTKEYIN_PEN_DOWN   (1u << 6)
 
 static DldiIpcService sDldiIpcService;
 
@@ -133,7 +131,7 @@ static void checkTouchToggle()
     if (sTouchCooldown > 0)
         sTouchCooldown--;
 
-    bool penDown = (REG_EXTKEYIN & EXTKEYIN_PEN_DOWN) == 0;
+    bool penDown = touchPenDown();
     if (penDown)
     {
         if (sTouchCooldown == 0 && sTouchUpFrames >= 3)
@@ -261,6 +259,7 @@ static void initializeArm7()
     sio_setGpioSiIrq(false);
     sio_setGpioMode(RCNT0_L_MODE_GPIO);
 
+    touchInit();
     rtc_init();
     sRtcStatus1 = rtc_readStatus1();
 
