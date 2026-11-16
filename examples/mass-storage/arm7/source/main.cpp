@@ -39,6 +39,10 @@ static volatile u32 sWriteSectors = 0;
 static u32 sLastSentStatus = 0xFFFFFFFFu;
 static bool sUsbStarted = false;
 
+static u32 sRtcStatus1 = 0;
+static u32 sLastSentTime = 0xFFFFFFFFu;
+static int sRtcPollFrames = 0;
+
 static volatile bool sDisconnectRequested = false;
 static int sDisconnectWaitFrames = 0;
 
@@ -53,11 +57,13 @@ extern FN_MEDIUM_WRITESECTORS _DLDI_writeSectors_ptr;
 
 static void vblankIrq(u32 irqMask)
 {
+    (void)irqMask;
     rtos_signalEvent(&sVBlankEvent);
 }
 
 static void mcuIrq(u32 irq2Mask)
 {
+    (void)irq2Mask;
     sMcuIrqFlag = true;
 }
 
@@ -161,6 +167,37 @@ static u32 findSdCardBlockCount()
     return 0;
 }
 
+static inline u32 bcdToBin(u8 bcd)
+{
+    return (u32)(((bcd >> 4) * 10) + (bcd & 0x0Fu));
+}
+
+static void sendRtcTimeUpdate(bool force)
+{
+    if (!force && ++sRtcPollFrames < 15)
+        return;
+    sRtcPollFrames = 0;
+
+    rtc_time_t t;
+    rtc_readTime(&t);
+
+    u32 hour = bcdToBin((u8)t.hour);
+    u32 min  = bcdToBin(t.minute);
+    u32 sec  = bcdToBin(t.second);
+
+    if (!(sRtcStatus1 & RTC_STATUS1_24HOUR))
+    {
+        hour = (hour % 12u) + ((t.amPm == RTC_PM) ? 12u : 0u);
+    }
+
+    u32 packed = ((hour & 0x1Fu) << 16) | ((min & 0x3Fu) << 8) | (sec & 0x3Fu);
+    if (force || packed != sLastSentTime)
+    {
+        sLastSentTime = packed;
+        ipc_sendFifoMessage(IPC_CHANNEL_SOUND, (USB_IPC_TAG_TIME << USB_IPC_TAG_SHIFT) | (packed & USB_IPC_VAL_MASK));
+    }
+}
+
 static void initializeArm7()
 {
     rtos_initIrq();
@@ -182,6 +219,7 @@ static void initializeArm7()
     sio_setGpioMode(RCNT0_L_MODE_GPIO);
 
     rtc_init();
+    sRtcStatus1 = rtc_readStatus1();
 
     sDldiIpcService.Start();
     ipc_setChannelHandler(IPC_CHANNEL_LOADER, loaderIpcHandler, nullptr);
@@ -213,6 +251,8 @@ static void initializeArm7()
     };
     tusb_init(0, &dev_init);
     sUsbStarted = true;
+
+    sendRtcTimeUpdate(true);
 
     rtos_createThread(&sUsbThread, 3, usbThreadMain, NULL, sUsbThreadStack, sizeof(sUsbThreadStack));
     rtos_wakeupThread(&sUsbThread);
@@ -255,6 +295,8 @@ static void sendUsbStatusUpdate()
         u32 writeKb = (sWriteSectors >> 1) & USB_IPC_VAL_MASK;
         ipc_sendFifoMessage(IPC_CHANNEL_SOUND, (USB_IPC_TAG_WRITE_KB << USB_IPC_TAG_SHIFT) | writeKb);
     }
+
+    sendRtcTimeUpdate(false);
 }
 
 static void updateArm7IdleState()
