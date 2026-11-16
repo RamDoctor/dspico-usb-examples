@@ -23,6 +23,9 @@
 #include "tusb.h"
 #include "usb_descriptors.h"
 
+#define REG_EXTKEYIN        (*(vu16*)0x04000136)
+#define EXTKEYIN_PEN_DOWN   (1u << 6)
+
 static DldiIpcService sDldiIpcService;
 
 rtos_mutex_t gCardMutex;
@@ -42,6 +45,10 @@ static bool sUsbStarted = false;
 static u32 sRtcStatus1 = 0;
 static u32 sLastSentTime = 0xFFFFFFFFu;
 static int sRtcPollFrames = 0;
+
+static bool sScreensEnabled = true;
+static int sTouchCooldown = 0;
+static int sTouchUpFrames = 0;
 
 static volatile bool sDisconnectRequested = false;
 static int sDisconnectWaitFrames = 0;
@@ -105,6 +112,42 @@ static void checkMcuIrq(void)
                 sState = Arm7State::ExitRequested;
             }
         }
+    }
+}
+
+static void setBothBacklights(bool enabled)
+{
+    u32 control = pmic_readRegister(PMIC_REG_CONTROL);
+    if (enabled)
+        control |= (PMIC_CONTROL_TOP_BACKLIGHT_ENABLE | PMIC_CONTROL_BOTTOM_BACKLIGHT_ENABLE);
+    else
+        control &= ~(PMIC_CONTROL_TOP_BACKLIGHT_ENABLE | PMIC_CONTROL_BOTTOM_BACKLIGHT_ENABLE);
+    pmic_writeRegister(PMIC_REG_CONTROL, (u8)control);
+}
+
+static void checkTouchToggle()
+{
+    if (!sUsbStarted)
+        return;
+
+    if (sTouchCooldown > 0)
+        sTouchCooldown--;
+
+    bool penDown = (REG_EXTKEYIN & EXTKEYIN_PEN_DOWN) == 0;
+    if (penDown)
+    {
+        if (sTouchCooldown == 0 && sTouchUpFrames >= 3)
+        {
+            sScreensEnabled = !sScreensEnabled;
+            setBothBacklights(sScreensEnabled);
+            sTouchCooldown = 18;
+        }
+        sTouchUpFrames = 0;
+    }
+    else
+    {
+        if (sTouchUpFrames < 10)
+            sTouchUpFrames++;
     }
 }
 
@@ -277,6 +320,8 @@ static void sendUsbStatusUpdate()
         status |= USB_STATUS_READING;
     if (didWrite)
         status |= USB_STATUS_WRITING;
+    if (!sScreensEnabled)
+        status |= USB_STATUS_SCREENS_OFF;
 
     if (status != sLastSentStatus)
     {
@@ -302,11 +347,17 @@ static void sendUsbStatusUpdate()
 static void updateArm7IdleState()
 {
     checkMcuIrq();
+    checkTouchToggle();
     sendUsbStatusUpdate();
 
     if (sDisconnectRequested)
     {
         sDisconnectRequested = false;
+        if (!sScreensEnabled)
+        {
+            sScreensEnabled = true;
+            setBothBacklights(true);
+        }
         if (sUsbStarted)
             tud_disconnect();
         snd_setMasterVolume(0);
@@ -344,6 +395,9 @@ static void performExit(ExitMode exitMode)
         }
         case ExitMode::PicoLoader:
         {
+            // Ensure both backlights are turned back on before returning to menu
+            setBothBacklights(true);
+
             // Disable sound
             snd_setMasterVolume(0);
             snd_setMasterEnable(false);
