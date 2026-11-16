@@ -503,6 +503,22 @@ static void drawTextPadded(vu16* map, int x, int y, int width, TextPal pal, cons
     drawText(map, x, y, pal, buf);
 }
 
+static void drawTextCentered(vu16* map, int x, int y, int width, TextPal pal, const char* text)
+{
+    char buf[33];
+    if (width > 32) width = 32;
+    int len = (int)strlen(text);
+    if (len > width) len = width;
+    int padLeft = (width - len) / 2;
+
+    for (int i = 0; i < width; i++)
+        buf[i] = ' ';
+    for (int i = 0; i < len; i++)
+        buf[padLeft + i] = text[i];
+    buf[width] = '\0';
+    drawText(map, x, y, pal, buf);
+}
+
 static void drawProgressBar(vu16* map, int x, int y, int widthTiles, u64 used, u64 total, TextPal pal)
 {
     u32 totalPx = (u32)widthTiles * 8u;
@@ -717,10 +733,10 @@ static void drawStaticHud(bool picoLoaderReady)
     vu16* topMap = GFX_BG_MAIN + BG_MAP_OFFSET_U16;
     vu16* subMap = GFX_BG_SUB + BG_MAP_OFFSET_U16;
 
-    // Upper top-screen panel (rows 4..11: USB status & Read/Write counters)
+    // Upper top-screen panel (rows 4..11: centered USB status & Read/Write counters)
     drawBox(topMap, 1, 4, 30, 8);
 
-    // Lower top-screen panel (stretched across rows 15..21 to fill the lower frame)
+    // Lower top-screen panel (rows 15..21 inside the lower theme frame)
     drawBox(topMap, 2, 15, 28, 7);
     if (sHasStorageStats)
     {
@@ -773,37 +789,38 @@ static void updateDynamicHud(u32 frame)
     const bool reading   = sReadHoldFrames > 0;
     const bool writing   = sWriteHoldFrames > 0;
 
+    // Centered text inside upper box (inner cols 2..29, width 28)
     if (mounted && !suspended)
-        drawTextPadded(topMap, 3, 5, 26, PAL_GREEN, "USB: CONNECTED");
+        drawTextCentered(topMap, 2, 5, 28, PAL_GREEN, "USB: CONNECTED");
     else if (suspended)
-        drawTextPadded(topMap, 3, 5, 26, PAL_YELLOW, "USB: SUSPENDED");
+        drawTextCentered(topMap, 2, 5, 28, PAL_YELLOW, "USB: SUSPENDED");
     else if (connected)
-        drawTextPadded(topMap, 3, 5, 26, PAL_YELLOW, "USB: ENUMERATING...");
+        drawTextCentered(topMap, 2, 5, 28, PAL_YELLOW, "USB: ENUMERATING...");
     else
-        drawTextPadded(topMap, 3, 5, 26, PAL_MUTED, "USB: WAITING FOR HOST");
+        drawTextCentered(topMap, 2, 5, 28, PAL_MUTED, "USB: WAITING FOR HOST");
 
     static const char spinner[4] = {'|', '/', '-', '\\'};
     char actLine[32];
     if (writing)
     {
         snprintf(actLine, sizeof(actLine), "SD: WRITING! DO NOT UNPLUG %c", spinner[(frame >> 2) & 3]);
-        drawTextPadded(topMap, 3, 7, 26, PAL_RED, actLine);
+        drawTextCentered(topMap, 2, 7, 28, PAL_RED, actLine);
     }
     else if (reading)
     {
         snprintf(actLine, sizeof(actLine), "SD: READING... %c", spinner[(frame >> 2) & 3]);
-        drawTextPadded(topMap, 3, 7, 26, PAL_YELLOW, actLine);
+        drawTextCentered(topMap, 2, 7, 28, PAL_YELLOW, actLine);
     }
     else
     {
-        drawTextPadded(topMap, 3, 7, 26, PAL_TEXT, "SD: IDLE");
+        drawTextCentered(topMap, 2, 7, 28, PAL_TEXT, "SD: IDLE");
     }
 
     char stats[32];
-    snprintf(stats, sizeof(stats), "Read:  %lu KB", (unsigned long)sReadKB);
-    drawTextPadded(topMap, 3, 9, 26, PAL_ACCENT, stats);
+    snprintf(stats, sizeof(stats), "Read: %lu KB", (unsigned long)sReadKB);
+    drawTextCentered(topMap, 2, 9, 28, PAL_ACCENT, stats);
     snprintf(stats, sizeof(stats), "Write: %lu KB", (unsigned long)sWriteKB);
-    drawTextPadded(topMap, 3, 10, 26, PAL_ACCENT, stats);
+    drawTextCentered(topMap, 2, 10, 28, PAL_ACCENT, stats);
 
     // Live device clock inside row 16 of the lower box
     char clockLine[32];
