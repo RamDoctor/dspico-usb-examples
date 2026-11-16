@@ -1,5 +1,6 @@
 #include "common.h"
 #include <nds/disc_io.h>
+#include <nds/touch.h>
 #include <nds/arm7/touch.h>
 #include <libtwl/rtos/rtosIrq.h>
 #include <libtwl/rtos/rtosThread.h>
@@ -113,16 +114,6 @@ static void checkMcuIrq(void)
     }
 }
 
-static void setBothBacklights(bool enabled)
-{
-    u32 control = pmic_readRegister(PMIC_REG_CONTROL);
-    if (enabled)
-        control |= (PMIC_CONTROL_TOP_BACKLIGHT_ENABLE | PMIC_CONTROL_BOTTOM_BACKLIGHT_ENABLE);
-    else
-        control &= ~(PMIC_CONTROL_TOP_BACKLIGHT_ENABLE | PMIC_CONTROL_BOTTOM_BACKLIGHT_ENABLE);
-    pmic_writeRegister(PMIC_REG_CONTROL, (u8)control);
-}
-
 static void checkTouchToggle()
 {
     if (!sUsbStarted)
@@ -134,10 +125,12 @@ static void checkTouchToggle()
     bool penDown = touchPenDown();
     if (penDown)
     {
+        touchPosition pos;
+        touchReadXY(&pos);
+
         if (sTouchCooldown == 0 && sTouchUpFrames >= 3)
         {
             sScreensEnabled = !sScreensEnabled;
-            setBothBacklights(sScreensEnabled);
             sTouchCooldown = 18;
         }
         sTouchUpFrames = 0;
@@ -352,11 +345,7 @@ static void updateArm7IdleState()
     if (sDisconnectRequested)
     {
         sDisconnectRequested = false;
-        if (!sScreensEnabled)
-        {
-            sScreensEnabled = true;
-            setBothBacklights(true);
-        }
+        sScreensEnabled = true;
         if (sUsbStarted)
             tud_disconnect();
         snd_setMasterVolume(0);
@@ -394,9 +383,6 @@ static void performExit(ExitMode exitMode)
         }
         case ExitMode::PicoLoader:
         {
-            // Ensure both backlights are turned back on before returning to menu
-            setBothBacklights(true);
-
             // Disable sound
             snd_setMasterVolume(0);
             snd_setMasterEnable(false);
