@@ -13,6 +13,7 @@
 #define USB_STATUS_CONNECTED    (1u << 2)
 #define USB_STATUS_READING      (1u << 3)
 #define USB_STATUS_WRITING      (1u << 4)
+#define USB_STATUS_SCREENS_OFF  (1u << 5)
 
 // Sent on IPC_CHANNEL_LOADER
 #define LOADER_CMD_DISCONNECT_USB   1u
