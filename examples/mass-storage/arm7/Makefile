@@ -16,6 +16,7 @@ include $(DEVKITARM)/ds_rules
 #---------------------------------------------------------------------------------
 BUILD		:=	build
 SOURCES		:=	source \
+				source/mmc \
 				../common/ipc \
 				source/ipcServices \
 				../../../platform \
