@@ -17,9 +17,13 @@
 #include <libtwl/mem/memSwap.h>
 #include <libtwl/i2c/i2cMcu.h>
 #include <libtwl/spi/spiPmic.h>
+#include "ipc/ThreadIpcService.h"
 #include "ipcServices/DldiIpcService.h"
+#include "dldiIpcCommand.h"
 #include "ipcChannels.h"
 #include "usbStatusIpc.h"
+#include "mmc/sdmmc.h"
+#include "mmc/tmio.h"
 #include "ExitMode.h"
 #include "Arm7State.h"
 #include "tusb.h"
@@ -52,7 +56,15 @@ static int sTouchUpFrames = 0;
 static volatile bool sDisconnectRequested = false;
 static int sDisconnectWaitFrames = 0;
 
-static u32 sSdBlockCount;
+static bool sDsiSdAvailable = false;
+static u32 sDspicoBlockCount = 0;
+static u32 sDsiSdBlockCount = 0;
+static volatile u8 sActiveDrive = 0;    // 0 = DSpico SD, 1 = 3DS/DSi SD
+static volatile u8 sRequestedDrive = 0;
+static volatile bool sSwitchRequested = false;
+static bool sSwitchingDrive = false;
+static int sSwitchWaitFrames = 0;
+
 static u8 sSector0Buffer[512] alignas(4);
 
 static rtos_thread_t sUsbThread;
@@ -60,6 +72,41 @@ static u32 sUsbThreadStack[512];
 
 extern FN_MEDIUM_READSECTORS _DLDI_readSectors_ptr;
 extern FN_MEDIUM_WRITESECTORS _DLDI_writeSectors_ptr;
+
+// Exposes DSi/3DS internal SD to ARM9 at boot for statvfs before USB starts
+class DsiSdBootIpcService : public ThreadIpcService
+{
+    u32 _threadStack[128];
+
+public:
+    DsiSdBootIpcService()
+        : ThreadIpcService(IPC_CHANNEL_DSI_SD, 6, _threadStack, sizeof(_threadStack)) { }
+
+    void HandleMessage(u32 data) override
+    {
+        auto cmd = reinterpret_cast<const dldi_ipc_cmd_t*>(data << 2);
+        bool ok = false;
+        switch (cmd->cmd)
+        {
+            case DLDI_IPC_CMD_SETUP:
+                ok = sDsiSdAvailable;
+                break;
+
+            case DLDI_IPC_CMD_READ_SECTORS:
+                if (sDsiSdAvailable)
+                    ok = (SDMMC_readSectors(SDMMC_DEV_CARD, cmd->sector, cmd->buffer, cmd->count) == SDMMC_ERR_NONE);
+                break;
+
+            case DLDI_IPC_CMD_WRITE_SECTORS:
+                if (sDsiSdAvailable)
+                    ok = (SDMMC_writeSectors(SDMMC_DEV_CARD, cmd->sector, cmd->buffer, cmd->count) == SDMMC_ERR_NONE);
+                break;
+        }
+        SendResponseMessage(ok ? 1u : 0u);
+    }
+};
+
+static DsiSdBootIpcService sDsiSdBootIpcService;
 
 static void vblankIrq(u32 irqMask)
 {
@@ -86,27 +133,35 @@ static void loaderIpcHandler(u32 channel, u32 data, void* arg)
         sExitMode = ExitMode::PicoLoader;
         sState = Arm7State::ExitRequested;
     }
+    else if (data == LOADER_CMD_SWITCH_TO_DSPICO)
+    {
+        sRequestedDrive = 0;
+        sSwitchRequested = true;
+    }
+    else if (data == LOADER_CMD_SWITCH_TO_DSI_SD)
+    {
+        if (sDsiSdAvailable)
+        {
+            sRequestedDrive = 1;
+            sSwitchRequested = true;
+        }
+    }
 }
 
 static void checkMcuIrq(void)
 {
-    // mcu only exists in DSi mode
     if (isDSiMode())
     {
-        // check and ack the flag atomically
         if (mem_swapByte(false, &sMcuIrqFlag))
         {
-            // check the irq mask
             u32 irqMask = mcu_getIrqMask();
             if (irqMask & MCU_IRQ_RESET)
             {
-                // power button was released
                 sExitMode = ExitMode::Reset;
                 sState = Arm7State::ExitRequested;
             }
             else if (irqMask & MCU_IRQ_POWER_OFF)
             {
-                // power button was held long to trigger a power off
                 sExitMode = ExitMode::PowerOff;
                 sState = Arm7State::ExitRequested;
             }
@@ -160,7 +215,7 @@ static void usbThreadMain(void* arg)
 }
 
 // Based on https://github.com/asiekierka/nrio-usb-disk/blob/main/source/msc.c msc_find_block_count by Asie
-static u32 findSdCardBlockCount()
+static u32 findDspicoBlockCount()
 {
     rtos_lockMutex(&gCardMutex);
     _DLDI_readSectors_ptr(0, 1, sSector0Buffer);
@@ -240,7 +295,6 @@ static void initializeArm7()
 
     rtos_createMutex(&gCardMutex);
 
-    // clear sound registers
     dmaFillWords(0, (void*)0x04000400, 0x100);
 
     pmic_setAmplifierEnable(true);
@@ -256,19 +310,27 @@ static void initializeArm7()
     rtc_init();
     sRtcStatus1 = rtc_readStatus1();
 
-    sDldiIpcService.Start();
-    ipc_setChannelHandler(IPC_CHANNEL_LOADER, loaderIpcHandler, nullptr);
-
-    snd_setMasterVolume(127);
-    snd_setMasterEnable(true);
-
     initializeVBlankIrq();
 
     if (isDSiMode())
     {
         rtos_setIrq2Func(RTOS_IRQ2_MCU, mcuIrq);
         rtos_enableIrq2Mask(RTOS_IRQ2_MCU);
+
+        TMIO_init();
+        if (SDMMC_init(SDMMC_DEV_CARD) == SDMMC_ERR_NONE)
+        {
+            sDsiSdBlockCount = SDMMC_getSectors(SDMMC_DEV_CARD);
+            sDsiSdAvailable = (sDsiSdBlockCount > 0);
+        }
     }
+
+    sDldiIpcService.Start();
+    sDsiSdBootIpcService.Start();
+    ipc_setChannelHandler(IPC_CHANNEL_LOADER, loaderIpcHandler, nullptr);
+
+    snd_setMasterVolume(127);
+    snd_setMasterEnable(true);
 
     ipc_setArm7SyncBits(7);
 
@@ -277,7 +339,7 @@ static void initializeArm7()
         rtos_waitEvent(&sVBlankEvent, true, true);
     }
 
-    sSdBlockCount = findSdCardBlockCount();
+    sDspicoBlockCount = findDspicoBlockCount();
 
     tusb_rhport_init_t dev_init =
     {
@@ -314,6 +376,10 @@ static void sendUsbStatusUpdate()
         status |= USB_STATUS_WRITING;
     if (!sScreensEnabled)
         status |= USB_STATUS_SCREENS_OFF;
+    if (sActiveDrive == 1)
+        status |= USB_STATUS_DRIVE_DSI_SD;
+    if (sSwitchingDrive)
+        status |= USB_STATUS_SWITCHING;
 
     if (status != sLastSentStatus)
     {
@@ -342,6 +408,33 @@ static void updateArm7IdleState()
     checkTouchToggle();
     sendUsbStatusUpdate();
 
+    if (sSwitchRequested && !sSwitchingDrive)
+    {
+        sSwitchRequested = false;
+        sSwitchingDrive = true;
+        if (sUsbStarted)
+            tud_disconnect();
+        sSwitchWaitFrames = 30; // ~0.5s clean USB unplug before re-enumerating new card
+    }
+
+    if (sSwitchingDrive && sSwitchWaitFrames > 0)
+    {
+        if (--sSwitchWaitFrames == 0)
+        {
+            sActiveDrive = sRequestedDrive;
+            sReadSectors = 0;
+            sWriteSectors = 0;
+            sReadPulse = false;
+            sWritePulse = false;
+            sSwitchingDrive = false;
+            if (sUsbStarted)
+                tud_connect();
+            ipc_sendFifoMessage(IPC_CHANNEL_SOUND, (USB_IPC_TAG_READ_KB << USB_IPC_TAG_SHIFT) | 0u);
+            ipc_sendFifoMessage(IPC_CHANNEL_SOUND, (USB_IPC_TAG_WRITE_KB << USB_IPC_TAG_SHIFT) | 0u);
+            ipc_sendFifoMessage(IPC_CHANNEL_LOADER, LOADER_RESP_DRIVE_SWITCHED);
+        }
+    }
+
     if (sDisconnectRequested)
     {
         sDisconnectRequested = false;
@@ -362,7 +455,7 @@ static void updateArm7IdleState()
 
     if (sState == Arm7State::ExitRequested)
     {
-        snd_setMasterVolume(0); // mute sound
+        snd_setMasterVolume(0);
     }
 }
 
@@ -383,29 +476,25 @@ static void performExit(ExitMode exitMode)
         }
         case ExitMode::PicoLoader:
         {
-            // Disable sound
             snd_setMasterVolume(0);
             snd_setMasterEnable(false);
             sys_setSoundPower(false);
             dmaFillWords(0, (void*)0x04000400, 0x100);
 
-            // Disable IRQs
-            *(vu32*)0x04000208 = 0;      // REG_IME
-            *(vu32*)0x04000210 = 0;      // REG_IE
-            *(vu32*)0x04000214 = ~0u;    // REG_IF
+            *(vu32*)0x04000208 = 0;
+            *(vu32*)0x04000210 = 0;
+            *(vu32*)0x04000214 = ~0u;
             if (isDSiMode())
             {
-                *(vu32*)0x04000218 = 0;   // REG_AUXIE
-                *(vu32*)0x0400021C = ~0u; // REG_AUXIF
+                *(vu32*)0x04000218 = 0;
+                *(vu32*)0x0400021C = ~0u;
             }
 
-            // Disable DMA
-            *(vu32*)0x040000BC = 0; // DMA0CNT
-            *(vu32*)0x040000C8 = 0; // DMA1CNT
-            *(vu32*)0x040000D4 = 0; // DMA2CNT
-            *(vu32*)0x040000E0 = 0; // DMA3CNT
+            *(vu32*)0x040000BC = 0;
+            *(vu32*)0x040000C8 = 0;
+            *(vu32*)0x040000D4 = 0;
+            *(vu32*)0x040000E0 = 0;
 
-            // Read entryPoint from picoLoader7 header mapped at 0x06000000
             void* entryPoint = *(void* const*)0x06000000;
             ipc_setArm7SyncBits(5);
             ((void (*)(void))entryPoint)();
@@ -413,7 +502,7 @@ static void performExit(ExitMode exitMode)
         }
     }
 
-    while (true); // wait infinitely for exit
+    while (true);
 }
 
 static void updateArm7ExitRequestedState()
@@ -457,9 +546,12 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16
     (void) lun;
 
     const char vid[] = "DSpico";
-    const char pid[] = "Mass Storage";
+    const char* pid = (sActiveDrive == 1) ? "3DS/DSi SD" : "Mass Storage";
     const char rev[] = "1.0";
 
+    memset(vendor_id, ' ', 8);
+    memset(product_id, ' ', 16);
+    memset(product_rev, ' ', 4);
     memcpy(vendor_id  , vid, strlen(vid));
     memcpy(product_id , pid, strlen(pid));
     memcpy(product_rev, rev, strlen(rev));
@@ -467,7 +559,11 @@ void tud_msc_inquiry_cb(uint8_t lun, uint8_t vendor_id[8], uint8_t product_id[16
 
 bool tud_msc_test_unit_ready_cb(uint8_t lun)
 {
-    (void) lun;
+    if (sSwitchingDrive)
+    {
+        tud_msc_set_sense(lun, SCSI_SENSE_NOT_READY, 0x3A, 0x00);
+        return false;
+    }
     return true;
 }
 
@@ -475,7 +571,7 @@ void tud_msc_capacity_cb(uint8_t lun, uint32_t* block_count, uint16_t* block_siz
 {
     (void) lun;
 
-    *block_count = sSdBlockCount;
+    *block_count = (sActiveDrive == 1) ? sDsiSdBlockCount : sDspicoBlockCount;
     *block_size  = 512;
 }
 
@@ -492,17 +588,28 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buff
 {
     (void) lun;
 
-    if (offset != 0 || (bufsize % 512) != 0)
+    if (sSwitchingDrive || offset != 0 || (bufsize % 512) != 0)
     {
         return -1;
     }
 
+    u32 count = bufsize / 512;
     sReadPulse = true;
-    sReadSectors += bufsize / 512;
+    sReadSectors += count;
 
-    rtos_lockMutex(&gCardMutex);
-    _DLDI_readSectors_ptr(lba, bufsize / 512, buffer);
-    rtos_unlockMutex(&gCardMutex);
+    if (sActiveDrive == 1)
+    {
+        if (!sDsiSdAvailable)
+            return -1;
+        if (SDMMC_readSectors(SDMMC_DEV_CARD, lba, buffer, count) != SDMMC_ERR_NONE)
+            return -1;
+    }
+    else
+    {
+        rtos_lockMutex(&gCardMutex);
+        _DLDI_readSectors_ptr(lba, count, buffer);
+        rtos_unlockMutex(&gCardMutex);
+    }
 
     return (int32_t)bufsize;
 }
@@ -517,17 +624,28 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t* 
 {
     (void) lun;
 
-    if (offset != 0 || (bufsize % 512) != 0)
+    if (sSwitchingDrive || offset != 0 || (bufsize % 512) != 0)
     {
         return -1;
     }
 
+    u32 count = bufsize / 512;
     sWritePulse = true;
-    sWriteSectors += bufsize / 512;
+    sWriteSectors += count;
 
-    rtos_lockMutex(&gCardMutex);
-    _DLDI_writeSectors_ptr(lba, bufsize / 512, buffer);
-    rtos_unlockMutex(&gCardMutex);
+    if (sActiveDrive == 1)
+    {
+        if (!sDsiSdAvailable)
+            return -1;
+        if (SDMMC_writeSectors(SDMMC_DEV_CARD, lba, buffer, count) != SDMMC_ERR_NONE)
+            return -1;
+    }
+    else
+    {
+        rtos_lockMutex(&gCardMutex);
+        _DLDI_writeSectors_ptr(lba, count, buffer);
+        rtos_unlockMutex(&gCardMutex);
+    }
 
     return (int32_t)bufsize;
 }
