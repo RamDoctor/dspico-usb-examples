@@ -94,12 +94,12 @@ public:
 
             case DLDI_IPC_CMD_READ_SECTORS:
                 if (sDsiSdAvailable)
-                    ok = (SDMMC_readSectors(SDMMC_DEV_CARD, cmd->sector, cmd->buffer, cmd->count) == SDMMC_ERR_NONE);
+                    ok = (pico_SDMMC_readSectors(SDMMC_DEV_CARD, cmd->sector, cmd->buffer, cmd->count) == SDMMC_ERR_NONE);
                 break;
 
             case DLDI_IPC_CMD_WRITE_SECTORS:
                 if (sDsiSdAvailable)
-                    ok = (SDMMC_writeSectors(SDMMC_DEV_CARD, cmd->sector, cmd->buffer, cmd->count) == SDMMC_ERR_NONE);
+                    ok = (pico_SDMMC_writeSectors(SDMMC_DEV_CARD, cmd->sector, cmd->buffer, cmd->count) == SDMMC_ERR_NONE);
                 break;
         }
         SendResponseMessage(ok ? 1u : 0u);
@@ -318,9 +318,9 @@ static void initializeArm7()
         rtos_enableIrq2Mask(RTOS_IRQ2_MCU);
 
         TMIO_init();
-        if (SDMMC_init(SDMMC_DEV_CARD) == SDMMC_ERR_NONE)
+        if (pico_SDMMC_init(SDMMC_DEV_CARD) == SDMMC_ERR_NONE)
         {
-            sDsiSdBlockCount = SDMMC_getSectors(SDMMC_DEV_CARD);
+            sDsiSdBlockCount = pico_SDMMC_getSectors(SDMMC_DEV_CARD);
             sDsiSdAvailable = (sDsiSdBlockCount > 0);
         }
     }
@@ -414,7 +414,7 @@ static void updateArm7IdleState()
         sSwitchingDrive = true;
         if (sUsbStarted)
             tud_disconnect();
-        sSwitchWaitFrames = 30; // ~0.5s clean USB unplug before re-enumerating new card
+        sSwitchWaitFrames = 30;
     }
 
     if (sSwitchingDrive && sSwitchWaitFrames > 0)
@@ -476,6 +476,13 @@ static void performExit(ExitMode exitMode)
         }
         case ExitMode::PicoLoader:
         {
+            if (isDSiMode())
+            {
+                if (sDsiSdAvailable)
+                    pico_SDMMC_deinit(SDMMC_DEV_CARD);
+                TMIO_deinit();
+            }
+
             snd_setMasterVolume(0);
             snd_setMasterEnable(false);
             sys_setSoundPower(false);
@@ -601,7 +608,7 @@ int32_t tud_msc_read10_cb(uint8_t lun, uint32_t lba, uint32_t offset, void* buff
     {
         if (!sDsiSdAvailable)
             return -1;
-        if (SDMMC_readSectors(SDMMC_DEV_CARD, lba, buffer, count) != SDMMC_ERR_NONE)
+        if (pico_SDMMC_readSectors(SDMMC_DEV_CARD, lba, buffer, count) != SDMMC_ERR_NONE)
             return -1;
     }
     else
@@ -637,7 +644,7 @@ int32_t tud_msc_write10_cb(uint8_t lun, uint32_t lba, uint32_t offset, uint8_t* 
     {
         if (!sDsiSdAvailable)
             return -1;
-        if (SDMMC_writeSectors(SDMMC_DEV_CARD, lba, buffer, count) != SDMMC_ERR_NONE)
+        if (pico_SDMMC_writeSectors(SDMMC_DEV_CARD, lba, buffer, count) != SDMMC_ERR_NONE)
             return -1;
     }
     else
